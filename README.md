@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 ______________________________________________________________________________
 
 This project is my first serious step into the intersection of quantitative finance, market microstructure, and low-latency systems engineering.
@@ -247,4 +246,3 @@ limit_order_book/
 **Status:** In Progress
 =======
 # limitorderbook
->>>>>>> 3102825004967dde63dd7da87710c83dc679ea3f
