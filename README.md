@@ -1,37 +1,3 @@
-______________________________________________________________________________
-
-This project is my first serious step into the intersection of quantitative finance, market microstructure, and low-latency systems engineering.
-I am deeply fascinated by how mathematics, data structures, and high-performance computing directly shape real-world financial markets. The Limit Order Book (LOB) sits at the very core of modern electronic trading, and building one from scratch is my way of understanding:
-How exchanges work internally
-
-
-How latency affects market behavior
-
-
-How C++ is used in performance-critical financial systems
-
-
-How quantitative ideas become executable systems
-
-
-This is a systems + finance + performance engineering project.
-I will continuously try to  document everything I learn while building this:
- from market theory to data structures, from CPU cache behavior to matching algorithms, and from Python-based research to C++ low-latency execution.
-
-
-
-______________________________________________________________________________________
-
-
-
-
-
-
-
-
-
-
-
 
 Limit Order Book (LOB) -  A major low latency project based on C++ and Python
 
