@@ -1,10 +1,14 @@
 #include "../include/http_server.hpp"
+#include "../include/nlohmann/json.hpp"
+#include "../include/order.hpp" 
 #include <iostream>
 #include <sstream>
 #include <cstring>
 #include <vector>
+#include <algorithm>
+#include <cmath> 
 
-// --- Cross-Platform Networking Header Logic ---
+
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
@@ -12,176 +16,125 @@
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #pragma comment(lib, "Ws2_32.lib")
-    using ssize_t = __int64;
     #define close closesocket
 #else
     #include <unistd.h>
     #include <sys/socket.h>
     #include <netinet/in.h>
     #include <arpa/inet.h>
-    typedef int SOCKET;
-    #define INVALID_SOCKET -1
 #endif
+
+using json = nlohmann::json;
 
 namespace trading {
 
-// Constructor
 HttpServer::HttpServer(int port, OrderBook& book)
-    : port_(port)
-    , server_socket_(-1)
-    , running_(false)
-    , order_book_(book)
-{}
+    : port_(port), server_socket_(-1), running_(false), order_book_(book) {}
 
-// Destructor
-HttpServer::~HttpServer() {
-    stop();
-}
+HttpServer::~HttpServer() { stop(); }
 
-// Start server
 void HttpServer::start() {
 #ifdef _WIN32
-    // Initialize Winsock for Windows
     WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "Failed to initialize Winsock" << std::endl;
-        return;
-    }
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
 #endif
 
-    // Create socket
     server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_socket_ < 0) {
-        std::cerr << "Failed to create socket" << std::endl;
-        return;
-    }
-    
-    // Set socket options (allow reuse) - Cast to const char* for Windows compatibility
     int opt = 1;
     setsockopt(server_socket_, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
     
-    // Bind to port
     struct sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port_);
     
     if (bind(server_socket_, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        std::cerr << "Failed to bind to port " << port_ << std::endl;
-        close(server_socket_);
+        std::cerr << "Bind failed" << std::endl;
         return;
     }
     
-    // Listen for connections
-    if (listen(server_socket_, 10) < 0) {
-        std::cerr << "Failed to listen" << std::endl;
-        close(server_socket_);
-        return;
-    }
-    
+    listen(server_socket_, 10);
     running_ = true;
-    std::cout << "🚀 HTTP Server listening on port " << port_ << std::endl;
+    std::cout << "🚀 Server listening on port " << port_ << std::endl;
     
-    // Accept loop
     while (running_) {
-        struct sockaddr_in client_address;
+        struct sockaddr_in client_addr;
 #ifdef _WIN32
-        int client_len = sizeof(client_address);
+        int addr_len = sizeof(client_addr);
 #else
-        socklen_t client_len = sizeof(client_address);
+        socklen_t addr_len = sizeof(client_addr);
 #endif
-        
-        int client_socket = accept(server_socket_, 
-                                   (struct sockaddr*)&client_address, 
-                                   &client_len);
-        
-        if (client_socket < 0) {
-            if (running_) {
-                std::cerr << "Failed to accept connection" << std::endl;
-            }
-            continue;
+        int client_socket = accept(server_socket_, (struct sockaddr*)&client_addr, &addr_len);
+        if (client_socket >= 0) {
+            handle_connection(client_socket);
+            close(client_socket);
         }
-        
-        handle_connection(client_socket);
-        close(client_socket);
     }
 }
 
-// Stop server
 void HttpServer::stop() {
     if (running_) {
         running_ = false;
-        if (server_socket_ >= 0) {
-            close(server_socket_);
-            server_socket_ = -1;
-        }
+        close(server_socket_);
 #ifdef _WIN32
         WSACleanup();
 #endif
-        std::cout << "Server stopped" << std::endl;
     }
 }
 
-// Handle connection
 void HttpServer::handle_connection(int client_socket) {
-    char buffer[4096] = {0};
-    // Use recv instead of read for cross-platform support
+    char buffer[1024 * 4] = {0};
     int bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-    
-    if (bytes_read <= 0) {
-        return;
-    }
-    
-    std::string request_str(buffer, bytes_read);
-    HttpRequest request = parse_request(request_str);
+    if (bytes_read <= 0) return;
+
+    std::string request_raw(buffer, bytes_read);
+    HttpRequest request = parse_request(request_raw);
     HttpResponse response = route_request(request);
     std::string response_str = build_response(response);
     
-    // Use send instead of write for cross-platform support
     send(client_socket, response_str.c_str(), (int)response_str.length(), 0);
 }
 
-// Parse HTTP request
 HttpRequest HttpServer::parse_request(const std::string& request_str) {
     HttpRequest request;
-    std::istringstream stream(request_str);
-    std::string line;
     
-    if (std::getline(stream, line)) {
-        std::istringstream line_stream(line);
-        line_stream >> request.method >> request.path;
-    }
-    
-    bool found_empty_line = false;
-    while (std::getline(stream, line)) {
-        if (line == "\r" || line.empty()) {
-            found_empty_line = true;
-            break;
+    // Split Header and Body
+    size_t body_pos = request_str.find("\r\n\r\n");
+    if (body_pos == std::string::npos) body_pos = request_str.find("\n\n");
+
+    if (body_pos != std::string::npos) {
+        // Headers
+        std::string header_section = request_str.substr(0, body_pos);
+        std::istringstream iss(header_section);
+        iss >> request.method >> request.path;
+
+        // Body: Find the first '{' and last '}' to strip socket junk
+        std::string raw_body = request_str.substr(body_pos);
+        size_t first_brace = raw_body.find('{');
+        size_t last_brace = raw_body.rfind('}');
+        
+        if (first_brace != std::string::npos && last_brace != std::string::npos) {
+            request.body = raw_body.substr(first_brace, last_brace - first_brace + 1);
         }
     }
     
-    if (found_empty_line) {
-        std::string body_line;
-        while (std::getline(stream, body_line)) {
-            request.body += body_line;
-        }
+    // Debug output
+    std::cout << "Method: " << request.method << ", Path: " << request.path << std::endl;
+    if (!request.body.empty()) {
+        std::cout << "Body: " << request.body << std::endl;
     }
     
     return request;
 }
 
-// Route request
 HttpResponse HttpServer::route_request(const HttpRequest& request) {
     std::cout << "[" << request.method << "] " << request.path << std::endl;
     
-    if (request.path == "/health") {
+    if (request.path == "/health" && request.method == "GET") {
         return handle_health_check();
     }
     else if (request.path == "/order" && request.method == "POST") {
         return handle_place_order(request.body);
-    }
-    else if (request.path == "/order" && request.method == "DELETE") {
-        return handle_cancel_order(request.body);
     }
     else if (request.path == "/orderbook" && request.method == "GET") {
         return handle_get_orderbook();
@@ -189,109 +142,232 @@ HttpResponse HttpServer::route_request(const HttpRequest& request) {
     else if (request.path == "/stats" && request.method == "GET") {
         return handle_get_stats();
     }
-    else {
-        return HttpResponse(404, "{\"error\":\"Not found\"}");
+    else if (request.path == "/order" && request.method == "DELETE") {
+        return handle_cancel_order(request.body);
     }
+    
+    return HttpResponse(404, "{\"error\":\"Not Found\"}");
 }
 
-// Handle place order
 HttpResponse HttpServer::handle_place_order(const std::string& body) {
     try {
-        size_t price_pos = body.find("\"price\":");
-        if (price_pos == std::string::npos) return HttpResponse(400, "{\"error\":\"Missing price\"}");
-        price_pos += 8;
-        Price price = std::stoul(body.substr(price_pos));
-        
-        size_t qty_pos = body.find("\"quantity\":");
-        if (qty_pos == std::string::npos) return HttpResponse(400, "{\"error\":\"Missing quantity\"}");
-        qty_pos += 11;
-        Quantity quantity = std::stoul(body.substr(qty_pos));
-        
-        size_t side_pos = body.find("\"side\":\"");
-        if (side_pos == std::string::npos) return HttpResponse(400, "{\"error\":\"Missing side\"}");
-        side_pos += 8;
-        std::string side_str = body.substr(side_pos, 3);
-        Side side = (side_str == "BUY") ? Side::BUY : Side::SELL;
-        
-        auto trades = order_book_.add_order(price, quantity, side);
-        
-        std::ostringstream response;
-        response << "{\"status\":\"success\",\"trades\":[";
-        for (size_t i = 0; i < trades.size(); ++i) {
-            const auto& trade = trades[i];
-            response << "{\"buyer_id\":" << trade.buyer_id 
-                     << ",\"seller_id\":" << trade.seller_id 
-                     << ",\"price\":" << trade.price 
-                     << ",\"quantity\":" << trade.quantity << "}";
-            if (i < trades.size() - 1) response << ",";
+        if (body.empty()) {
+            return HttpResponse(400, "{\"error\":\"No JSON body found\"}");
         }
-        response << "]}";
         
-        return HttpResponse(200, response.str());
+        auto j = json::parse(body);
+
+        // Strict validation
+        if (!j.contains("price") || !j.contains("quantity") || !j.contains("side")) {
+            json err;
+            err["error"] = "Missing required fields";
+            err["required"] = {"price", "quantity", "side"};
+            err["received"] = j;
+            return HttpResponse(400, err.dump());
+        }
+
+        // ============================================================
+        // CLEAR PRICE LOGIC: Always expect dollars (e.g., 100.50)
+        // Internally convert to cents (10050)
+        // ============================================================
+        Price price;
         
-    } catch (...) {
-        return HttpResponse(400, "{\"error\":\"Invalid request data\"}");
+        if (j["price"].is_number()) {
+            double price_dollars = j["price"].get<double>();
+            
+            // Validate range
+            if (price_dollars <= 0.0) {
+                return HttpResponse(400, "{\"error\":\"Price must be positive\"}");
+            }
+            if (price_dollars > 1000000.0) {
+                return HttpResponse(400, "{\"error\":\"Price too large (max: $1,000,000)\"}");
+            }
+            
+            // Convert to cents (round to nearest cent)
+            price = static_cast<Price>(std::round(price_dollars * 100.0));
+            
+        } else {
+            return HttpResponse(400, "{\"error\":\"Price must be a number\"}");
+        }
+        
+        // ============================================================
+        // QUANTITY VALIDATION
+        // ============================================================
+        if (!j["quantity"].is_number_unsigned()) {
+            return HttpResponse(400, "{\"error\":\"Quantity must be a positive integer\"}");
+        }
+        
+        Quantity quantity = j["quantity"].get<Quantity>();
+        
+        if (quantity == 0) {
+            return HttpResponse(400, "{\"error\":\"Quantity must be greater than 0\"}");
+        }
+        if (quantity > 1000000) {
+            return HttpResponse(400, "{\"error\":\"Quantity too large (max: 1,000,000)\"}");
+        }
+        
+        // ============================================================
+        // SIDE VALIDATION
+        // ============================================================
+        if (!j["side"].is_string()) {
+            return HttpResponse(400, "{\"error\":\"Side must be a string\"}");
+        }
+        
+        std::string side_str = j["side"].get<std::string>();
+        
+        // Convert to uppercase for case-insensitive matching
+        std::transform(side_str.begin(), side_str.end(), side_str.begin(), ::toupper);
+        
+        Side side;
+        if (side_str == "BUY") {
+            side = Side::BUY;
+        } else if (side_str == "SELL") {
+            side = Side::SELL;
+        } else {
+            return HttpResponse(400, "{\"error\":\"Side must be 'BUY' or 'SELL'\"}");
+        }
+
+        // ============================================================
+        // ADD ORDER TO BOOK
+        // ============================================================
+        auto trades = order_book_.add_order(price, quantity, side);
+
+        // ============================================================
+        // BUILD RESPONSE WITH HUMAN-READABLE PRICES
+        // ============================================================
+        json res;
+        res["status"] = "success";
+        res["order_count"] = order_book_.get_order_count();
+        res["price_received"] = j["price"].get<double>();  // Echo back what user sent
+        res["price_internal"] = price;  // Show internal representation
+        
+        // Add trades
+        json trades_array = json::array();
+        for (const auto& trade : trades) {
+            json trade_obj;
+            trade_obj["buyer_id"] = trade.buyer_id;
+            trade_obj["seller_id"] = trade.seller_id;
+            trade_obj["price"] = trade.price / 100.0;  // Convert back to dollars for display
+            trade_obj["price_cents"] = trade.price;     // Also show cents for debugging
+            trade_obj["quantity"] = trade.quantity;
+            trades_array.push_back(trade_obj);
+        }
+        res["trades"] = trades_array;
+        
+        return HttpResponse(200, res.dump());
+    } 
+    catch (const json::parse_error& e) {
+        json err;
+        err["error"] = "JSON parse error";
+        err["details"] = e.what();
+        err["body"] = body;
+        return HttpResponse(400, err.dump());
+    }
+    catch (const std::exception& e) {
+        json err;
+        err["error"] = "Exception";
+        err["msg"] = e.what();
+        return HttpResponse(400, err.dump());
     }
 }
 
-// Handle cancel order
 HttpResponse HttpServer::handle_cancel_order(const std::string& body) {
     try {
-        size_t id_pos = body.find("\"order_id\":");
-        if (id_pos == std::string::npos) return HttpResponse(400, "{\"error\":\"Missing order_id\"}");
-        id_pos += 11;
-        OrderId order_id = std::stoull(body.substr(id_pos));
+        auto j = json::parse(body);
         
-        if (order_book_.cancel_order(order_id)) {
-            return HttpResponse(200, "{\"status\":\"cancelled\"}");
-        } else {
-            return HttpResponse(404, "{\"error\":\"Order not found\"}");
+        if (!j.contains("order_id")) {
+            return HttpResponse(400, "{\"error\":\"Missing order_id\"}");
         }
-    } catch (...) {
+        
+        OrderId order_id = j["order_id"].get<OrderId>();
+        bool success = order_book_.cancel_order(order_id);
+        
+        json res;
+        if (success) {
+            res["status"] = "cancelled";
+            res["order_id"] = order_id;
+            return HttpResponse(200, res.dump());
+        } else {
+            res["error"] = "Order not found";
+            res["order_id"] = order_id;
+            return HttpResponse(404, res.dump());
+        }
+    }
+    catch (const std::exception& e) {
         return HttpResponse(400, "{\"error\":\"Invalid request\"}");
     }
 }
 
 HttpResponse HttpServer::handle_get_orderbook() {
-    std::ostringstream response;
-    response << "{\"best_bid\":" << order_book_.get_best_bid() 
-             << ",\"best_ask\":" << order_book_.get_best_ask() 
-             << ",\"spread\":" << order_book_.get_spread() 
-             << ",\"order_count\":" << order_book_.get_order_count() << "}";
-    return HttpResponse(200, response.str());
+    json res;
+    
+    // Return prices in dollars for user-friendliness
+    Price best_bid = order_book_.get_best_bid();
+    Price best_ask = order_book_.get_best_ask();
+    Price spread = order_book_.get_spread();
+    
+    res["best_bid"] = best_bid > 0 ? best_bid / 100.0 : 0.0;
+    res["best_ask"] = best_ask > 0 ? best_ask / 100.0 : 0.0;
+    res["spread"] = spread > 0 ? spread / 100.0 : 0.0;
+    
+    // Also include internal representation for debugging
+    res["best_bid_cents"] = best_bid;
+    res["best_ask_cents"] = best_ask;
+    
+    res["order_count"] = order_book_.get_order_count();
+    res["bid_levels"] = order_book_.get_bid_level_count();
+    res["ask_levels"] = order_book_.get_ask_level_count();
+    
+    return HttpResponse(200, res.dump());
 }
 
 HttpResponse HttpServer::handle_get_stats() {
-    std::ostringstream response;
-    response << "{\"total_orders\":" << order_book_.get_order_count() 
-             << ",\"bid_levels\":" << order_book_.get_bid_level_count() 
-             << ",\"ask_levels\":" << order_book_.get_ask_level_count() 
-             << ",\"best_bid\":" << order_book_.get_best_bid() 
-             << ",\"best_ask\":" << order_book_.get_best_ask() 
-             << ",\"spread\":" << order_book_.get_spread() << "}";
-    return HttpResponse(200, response.str());
+    json res;
+    res["total_orders"] = order_book_.get_order_count();
+    res["bid_levels"] = order_book_.get_bid_level_count();
+    res["ask_levels"] = order_book_.get_ask_level_count();
+    
+    Price best_bid = order_book_.get_best_bid();
+    Price best_ask = order_book_.get_best_ask();
+    Price spread = order_book_.get_spread();
+    
+    res["best_bid"] = best_bid > 0 ? best_bid / 100.0 : 0.0;
+    res["best_ask"] = best_ask > 0 ? best_ask / 100.0 : 0.0;
+    res["spread"] = spread > 0 ? spread / 100.0 : 0.0;
+    
+    if (best_bid > 0 && best_ask > 0) {
+        res["mid_price"] = (best_bid + best_ask) / 200.0;  // Divide by 200 because already in cents
+    } else {
+        res["mid_price"] = nullptr;
+    }
+    
+    return HttpResponse(200, res.dump());
 }
 
 HttpResponse HttpServer::handle_health_check() {
     return HttpResponse(200, "{\"status\":\"ok\"}");
 }
 
-// Build HTTP response
 std::string HttpServer::build_response(const HttpResponse& response) {
-    std::ostringstream stream;
-    stream << "HTTP/1.1 " << response.status_code << " ";
-    if (response.status_code == 200) stream << "OK";
-    else if (response.status_code == 400) stream << "Bad Request";
-    else if (response.status_code == 404) stream << "Not Found";
-    else stream << "Unknown";
+    std::ostringstream oss;
     
-    stream << "\r\nContent-Type: application/json\r\n"
-           << "Content-Length: " << response.body.length() << "\r\n"
-           << "Access-Control-Allow-Origin: *\r\n"
-           << "Connection: close\r\n\r\n"
-           << response.body;
+    std::string status_text;
+    switch(response.status_code) {
+        case 200: status_text = "OK"; break;
+        case 400: status_text = "Bad Request"; break;
+        case 404: status_text = "Not Found"; break;
+        case 500: status_text = "Internal Server Error"; break;
+        case 501: status_text = "Not Implemented"; break;
+        default: status_text = "Unknown"; break;
+    }
     
-    return stream.str();
+    oss << "HTTP/1.1 " << response.status_code << " " << status_text << "\r\n"
+        << "Content-Type: application/json\r\n"
+        << "Content-Length: " << response.body.length() << "\r\n"
+        << "Access-Control-Allow-Origin: *\r\n"
+        << "Connection: close\r\n\r\n"
+        << response.body;
+    return oss.str();
 }
 
 } // namespace trading
