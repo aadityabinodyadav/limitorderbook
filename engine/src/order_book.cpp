@@ -5,23 +5,13 @@
 
 namespace trading {
 
-// --- Public Methods ---
-
 std::vector<Trade> OrderBook::add_order(Price price, Quantity quantity, Side side) {
-    // 1. Create the new order
     Order* order = new Order(next_order_id_++, price, quantity, side);
-    
-    // 2. Track it in our central lookup map
-    orders_[order->id] = order;
-    
-    // 3. Try to match it against resting liquidity
-    std::vector<Trade> trades = match_order(order);
-    
-    // 4. If there's still quantity left, it's a "Maker" order; add to book
-    if (!order->is_fully_filled()) {
+        orders_[order->id] = order;
+        std::vector<Trade> trades = match_order(order);
+        if (!order->is_fully_filled()) {
         add_to_book(order);
     } else {
-        // If filled immediately (IOC style behavior), cleanup
         orders_.erase(order->id);
         delete order;
     }
@@ -48,8 +38,6 @@ bool OrderBook::cancel_order(OrderId order_id) {
 std::vector<Trade> OrderBook::match_order(Order* order) {
     std::vector<Trade> local_trades;
     
-    // Dispatch to the template based on side.
-    // This solves the 'operand types are incompatible' error.
     if (order->side == Side::BUY) {
         match_against(order, asks_, local_trades);
     } else {
@@ -59,11 +47,7 @@ std::vector<Trade> OrderBook::match_order(Order* order) {
     return local_trades;
 }
 
-/**
- * Template Helper: Handles the actual matching process.
- * T will be either std::map<Price, PriceLevel, std::less<Price>> (Asks)
- * or std::map<Price, PriceLevel, std::greater<Price>> (Bids)
- */
+
 template<typename T>
 void OrderBook::match_against(Order* taker_order, T& opposite_side, std::vector<Trade>& trades) {
     while (!taker_order->is_fully_filled() && !opposite_side.empty()) {
@@ -76,7 +60,6 @@ void OrderBook::match_against(Order* taker_order, T& opposite_side, std::vector<
                                                           : (taker_order->price <= best_resting_price);
         if (!can_match) break;
 
-        // Match against orders in this price level (FIFO)
         while (!taker_order->is_fully_filled() && !price_level.is_empty()) {
             Order* maker_order = price_level.get_head();
             Quantity fill_qty = std::min(taker_order->remaining_quantity(), maker_order->remaining_quantity());
@@ -97,7 +80,6 @@ void OrderBook::match_against(Order* taker_order, T& opposite_side, std::vector<
             maker_order->fill(fill_qty);
             price_level.update_quantity(fill_qty);
 
-            // If maker is filled, remove it from the system
             if (maker_order->is_fully_filled()) {
                 price_level.remove_order(maker_order);
                 orders_.erase(maker_order->id);
@@ -105,7 +87,6 @@ void OrderBook::match_against(Order* taker_order, T& opposite_side, std::vector<
             }
         }
 
-        // Cleanup empty price levels
         if (price_level.is_empty()) {
             opposite_side.erase(it);
         }
@@ -153,7 +134,6 @@ void OrderBook::print() const {
     std::cout << "          LIMIT ORDER BOOK\n";
     std::cout << std::string(40, '=') << "\n";
     
-    // Print Asks (Sell Side) - Top of the book is lowest price
     std::cout << "\n--- ASKS (SELLS) ---\n";
     if (asks_.empty()) std::cout << "      (Empty)\n";
     for (auto it = asks_.rbegin(); it != asks_.rend(); ++it) {
@@ -166,7 +146,6 @@ void OrderBook::print() const {
         std::cout << "\n[ SPREAD: " << (get_best_ask() - get_best_bid()) << " ]\n";
     }
 
-    // Print Bids (Buy Side) - Top of the book is highest price
     std::cout << "\n--- BIDS (BUYS) ---\n";
     if (bids_.empty()) std::cout << "      (Empty)\n";
     for (const auto& [price, level] : bids_) {

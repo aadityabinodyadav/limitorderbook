@@ -33,8 +33,8 @@ int main() {
     g_server = &server;
     
     // Setup signal handlers
-    signal(SIGINT, signal_handler);   // Ctrl+C
-    signal(SIGTERM, signal_handler);  // kill command
+    signal(SIGINT, signal_handler);  
+    signal(SIGTERM, signal_handler); 
     
     // Start server (blocking)
     server.start();
